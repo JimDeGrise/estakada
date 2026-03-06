@@ -18,9 +18,16 @@ from aiogram.types import (
     InlineQueryResultArticle,
     InputTextMessageContent,
 )
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiosqlite import connect
 from dotenv import load_dotenv
+
+
+class EditState(StatesGroup):
+    waiting_for_value = State()
+
 
 # ================= INIT =================
 
@@ -143,6 +150,16 @@ async def db_execute_fetch(sql: str, params: tuple = (), many: bool = False):
                 return await cur.fetchall() if many else await cur.fetchone()
             await db.commit()
             return cur.lastrowid
+
+
+async def update_people_field(rec_id: int, field: str, value: str) -> bool:
+    if field not in EDITABLE_FIELDS:
+        return False
+    await db_execute_fetch(
+        f"UPDATE people SET {field} = ? WHERE id = ?",
+        (value, rec_id),
+    )
+    return True
 
 
 # ================= SQLITE PRAGMAS (Raspberry Pi / systemd) =================
@@ -470,6 +487,12 @@ FIELD_LABELS = {
     "latitude": "Широта",
     "longitude": "Долгота",
 }
+
+EDITABLE_FIELDS = [
+    "floor", "object_number", "sizes", "name",
+    "gender", "passport", "plate", "phone",
+    "latitude", "longitude",
+]
 
 
 async def search_db_page(query: str, page: int = 0):
@@ -810,6 +833,7 @@ async def start_cmd(message: Message):
 • `/allowed` - список временных доступов + кнопки отмены
 • `/guests` - последние 10 пользователей (уникальные)
 • `/export` - экспорт CSV по этажам (flor1.csv, flor2.csv ...)
+• `/edit <id> <поле> <значение>` - прямое редактирование записи по ID
 
 💡 **Инлайн:** введите запрос после @имя_бота
     """
@@ -966,6 +990,53 @@ async def owner_cmd(message: Message):
 
     kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
     await message.answer("Найдено несколько совпадений (однофамильцы). Выберите:", reply_markup=kb)
+
+
+@dp.message(Command("cancel"))
+async def cancel_edit_cmd(message: Message, state: FSMContext):
+    current = await state.get_state()
+    if current is not None:
+        await state.clear()
+        await message.answer("❌ Редактирование отменено.")
+    else:
+        await message.answer("Нечего отменять.")
+
+
+@dp.message(Command("edit"))
+async def edit_cmd(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await message.answer("❌ Только администратор.")
+        return
+
+    # Формат: /edit <id> <field> <value>
+    parts = message.text.split(maxsplit=3)
+    if len(parts) < 4:
+        await message.answer(
+            "Использование: `/edit <id> <поле> <значение>`\n"
+            "Пример: `/edit 42 phone +79001234567`\n\n"
+            f"Доступные поля: {', '.join(EDITABLE_FIELDS)}"
+        )
+        return
+
+    try:
+        rec_id = int(parts[1])
+    except ValueError:
+        await message.answer("❌ ID должен быть числом.")
+        return
+
+    field = parts[2].strip().lower()
+    new_value = parts[3].strip()
+
+    success = await update_people_field(rec_id, field, new_value)
+    if success:
+        label = FIELD_LABELS.get(field, field)
+        try:
+            await add_user_log(message.from_user, f"edit_field:{field}:id={rec_id}")
+        except Exception as e:
+            logger.warning(f"Cannot log edit: {e}")
+        await message.answer(f"✅ Поле **{label}** записи ID {rec_id} обновлено на: `{new_value}`")
+    else:
+        await message.answer(f"❌ Недопустимое поле. Допустимые: {', '.join(EDITABLE_FIELDS)}")
 
 
 @dp.message(Command("stats"))
@@ -1175,10 +1246,81 @@ async def view_handler(callback: types.CallbackQuery):
             await callback.message.answer("Запись не найдена.")
             return
 
-        await callback.message.answer(format_card_text(rec))
+        text = format_card_text(rec)
+
+        if is_admin(callback.from_user.id):
+            kb_rows = [
+                [InlineKeyboardButton(
+                    text=f"✏️ {FIELD_LABELS.get(f, f)}",
+                    callback_data=build_cbdata("edit_field", id=rec_id, field=f)
+                )]
+                for f in EDITABLE_FIELDS
+            ]
+            kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
+            await callback.message.answer(text, reply_markup=kb)
+        else:
+            await callback.message.answer(text)
+
     except Exception as e:
         logger.error(f"Error in view_handler: {e}", exc_info=True)
         await callback.answer("Ошибка", show_alert=True)
+
+
+@dp.callback_query(lambda c: c.data.startswith("edit_field"))
+async def edit_field_handler(callback: types.CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return await callback.answer("Только администратор", show_alert=True)
+
+    await callback.answer()
+    _, data = parse_cbdata(callback.data)
+    rec_id = int(data.get("id", 0))
+    field = data.get("field", "")
+
+    if not rec_id or not field:
+        await callback.message.answer("❌ Ошибка: не указан ID или поле.")
+        return
+
+    await state.set_state(EditState.waiting_for_value)
+    await state.update_data(rec_id=rec_id, field=field)
+
+    label = FIELD_LABELS.get(field, field)
+    await callback.message.answer(
+        f"✏️ Введите новое значение для поля **{label}** (запись ID: {rec_id}):\n"
+        f"Для отмены отправьте /cancel"
+    )
+
+
+@dp.message(EditState.waiting_for_value)
+async def edit_value_received(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+
+    fsm_data = await state.get_data()
+    rec_id = fsm_data.get("rec_id")
+    field = fsm_data.get("field")
+    new_value = (message.text or "").strip()
+
+    await state.clear()
+
+    if not rec_id or not field:
+        await message.answer("❌ Ошибка состояния. Попробуйте заново.")
+        return
+
+    success = await update_people_field(rec_id, field, new_value)
+
+    if success:
+        label = FIELD_LABELS.get(field, field)
+        try:
+            await add_user_log(message.from_user, f"edit_field:{field}:id={rec_id}")
+        except Exception as e:
+            logger.warning(f"Cannot log edit: {e}")
+        await message.answer(
+            f"✅ Поле **{label}** записи ID {rec_id} обновлено.\n"
+            f"Новое значение: `{new_value}`"
+        )
+    else:
+        await message.answer("❌ Ошибка обновления. Недопустимое поле.")
 
 
 # ================= INLINE =================
