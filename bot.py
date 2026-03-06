@@ -18,6 +18,8 @@ from aiogram.types import (
     InlineQueryResultArticle,
     InputTextMessageContent,
 )
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiosqlite import connect
 from dotenv import load_dotenv
@@ -51,6 +53,10 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
 PAGE_SIZE = 5
+
+
+class EditState(StatesGroup):
+    waiting_for_value = State()
 
 # ================= SEARCH CONTEXT STORAGE =================
 SEARCH_CONTEXT: Dict[str, Dict[str, Any]] = {}
@@ -471,6 +477,12 @@ FIELD_LABELS = {
     "longitude": "Долгота",
 }
 
+EDITABLE_FIELDS = [
+    "floor", "object_number", "sizes", "name",
+    "gender", "passport", "plate", "phone",
+    "latitude", "longitude",
+]
+
 
 async def search_db_page(query: str, page: int = 0):
     q_formatted = capitalize_words(query)
@@ -560,6 +572,16 @@ async def send_search_page(chat_id: int, query: str, page: int):
         )
         text = f"{r.get('name') or '-'} — {r.get('object_number') or '-'}"
         await bot.send_message(chat_id, text, reply_markup=kb)
+
+
+async def update_people_field(rec_id: int, field: str, value: str) -> bool:
+    if field not in EDITABLE_FIELDS:
+        return False
+    await db_execute_fetch(
+        f"UPDATE people SET {field} = ? WHERE id = ?",
+        (value, rec_id),
+    )
+    return True
 
 
 async def send_object_search_page(chat_id: int, object_id: str):
@@ -1175,10 +1197,121 @@ async def view_handler(callback: types.CallbackQuery):
             await callback.message.answer("Запись не найдена.")
             return
 
-        await callback.message.answer(format_card_text(rec))
+        text = format_card_text(rec)
+
+        if is_admin(callback.from_user.id):
+            kb = InlineKeyboardMarkup(
+                inline_keyboard=[[
+                    InlineKeyboardButton(text="✏️ Редактировать", callback_data=build_cbdata("edit_menu", id=rec_id))
+                ]]
+            )
+            await callback.message.answer(text, reply_markup=kb)
+        else:
+            await callback.message.answer(text)
     except Exception as e:
         logger.error(f"Error in view_handler: {e}", exc_info=True)
         await callback.answer("Ошибка", show_alert=True)
+
+
+@dp.callback_query(lambda c: c.data.startswith("edit_menu"))
+async def edit_menu_handler(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return await callback.answer("Только администратор", show_alert=True)
+
+    await callback.answer()
+    _, data = parse_cbdata(callback.data)
+    rec_id = int(data.get("id", 0))
+
+    if not rec_id:
+        await callback.message.answer("❌ Ошибка: не указан ID записи.")
+        return
+
+    kb_rows = [
+        [InlineKeyboardButton(
+            text=f"✏️ {FIELD_LABELS.get(f, f)}",
+            callback_data=build_cbdata("edit_field", id=rec_id, field=f)
+        )]
+        for f in EDITABLE_FIELDS
+    ]
+    kb_rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data=build_cbdata("edit_cancel", id=rec_id))])
+    kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
+
+    await callback.message.answer("✏️ Выберите поле для редактирования:", reply_markup=kb)
+
+
+@dp.callback_query(lambda c: c.data.startswith("edit_cancel"))
+async def edit_cancel_handler(callback: types.CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return await callback.answer("Только администратор", show_alert=True)
+
+    await callback.answer()
+    await state.clear()
+    try:
+        await callback.message.edit_text("❌ Редактирование отменено.")
+    except Exception:
+        await callback.message.answer("❌ Редактирование отменено.")
+
+
+@dp.callback_query(lambda c: c.data.startswith("edit_field"))
+async def edit_field_handler(callback: types.CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return await callback.answer("Только администратор", show_alert=True)
+
+    await callback.answer()
+    _, data = parse_cbdata(callback.data)
+    rec_id = int(data.get("id", 0))
+    field = data.get("field", "")
+
+    if not rec_id or not field:
+        await callback.message.answer("❌ Ошибка: не указан ID или поле.")
+        return
+
+    await state.set_state(EditState.waiting_for_value)
+    await state.update_data(rec_id=rec_id, field=field)
+
+    label = FIELD_LABELS.get(field, field)
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(text="❌ Отмена", callback_data=build_cbdata("edit_cancel", id=rec_id))
+        ]]
+    )
+    await callback.message.answer(
+        f"✏️ Введите новое значение для поля **{label}** (запись ID: {rec_id}):",
+        reply_markup=kb
+    )
+
+
+@dp.message(EditState.waiting_for_value)
+async def edit_value_received(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+
+    fsm_data = await state.get_data()
+    rec_id = fsm_data.get("rec_id")
+    field = fsm_data.get("field")
+    new_value = (message.text or "").strip()
+
+    await state.clear()
+
+    if not rec_id or not field:
+        await message.answer("❌ Ошибка состояния. Попробуйте заново.")
+        return
+
+    success = await update_people_field(rec_id, field, new_value)
+
+    if success:
+        label = FIELD_LABELS.get(field, field)
+        try:
+            await add_user_log(message.from_user, f"edit_field:{field}:id={rec_id}")
+        except Exception as e:
+            logger.warning(f"Cannot log edit: {e}")
+        await message.answer(
+            f"✅ Поле **{label}** записи ID {rec_id} обновлено.\n"
+            f"Новое значение: `{new_value}`"
+        )
+    else:
+        await message.answer("❌ Ошибка обновления. Недопустимое поле.")
 
 
 # ================= INLINE =================
