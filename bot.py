@@ -172,6 +172,26 @@ async def db_init_pragmas():
         await db.commit()
 
 
+async def migrate_people_table():
+    """Add note column and drop latitude/longitude/photo_url from people table."""
+    columns_to_drop = ("latitude", "longitude", "photo_url")
+    async with connect(DB_PATH, timeout=10.0) as db:
+        try:
+            await db.execute("ALTER TABLE people ADD COLUMN note TEXT")
+            await db.commit()
+            logger.info("Migration: added 'note' column to people")
+        except Exception as e:
+            logger.debug(f"Migration: 'note' column already exists or error: {e}")
+
+        for col in columns_to_drop:
+            try:
+                await db.execute(f"ALTER TABLE people DROP COLUMN {col}")
+                await db.commit()
+                logger.info(f"Migration: dropped '{col}' column from people")
+            except Exception as e:
+                logger.debug(f"Migration: could not drop '{col}' column: {e}")
+
+
 # ================= ACCESS REQUEST + TEMP 24H =================
 
 def utcnow() -> datetime:
@@ -483,15 +503,13 @@ FIELD_LABELS = {
     "passport": "Паспорт",
     "plate": "Документ",
     "phone": "Телефон",
-    "photo_url": "Фото",
-    "latitude": "Широта",
-    "longitude": "Долгота",
+    "note": "Аннотация",
 }
 
 EDITABLE_FIELDS = [
     "floor", "object_number", "sizes", "name",
     "gender", "passport", "plate", "phone",
-    "latitude", "longitude",
+    "note",
 ]
 
 
@@ -514,7 +532,7 @@ async def search_db_page(query: str, page: int = 0):
 
     sql = f"""
         SELECT id, floor, object_number, sizes, name, gender,
-               passport, plate, phone, photo_url, latitude, longitude
+               passport, plate, phone
         FROM people
         WHERE {" OR ".join(where_clauses)}
         ORDER BY id
@@ -540,7 +558,7 @@ async def search_by_object_id(object_id: str) -> List[Dict[str, Any]]:
     rows = await db_execute_fetch(
         """
         SELECT id, floor, object_number, sizes, name, gender,
-               passport, plate, phone, photo_url, latitude, longitude
+               passport, plate, phone
         FROM people
         WHERE UPPER(object_number) = ?
         ORDER BY floor, name
@@ -551,7 +569,7 @@ async def search_by_object_id(object_id: str) -> List[Dict[str, Any]]:
     return rows or []
 
 
-def format_card_text(rec: Dict[str, Any]) -> str:
+def format_card_text(rec: Dict[str, Any], admin: bool = False) -> str:
     lines = [
         f"ID: {rec.get('id')}",
         f"{FIELD_LABELS['floor']}: {rec.get('floor') or '-'}",
@@ -563,8 +581,8 @@ def format_card_text(rec: Dict[str, Any]) -> str:
         f"{FIELD_LABELS['plate']}: {rec.get('plate') or '-'}",
         f"{FIELD_LABELS['phone']}: {rec.get('phone') or '-'}",
     ]
-    if rec.get("latitude") and rec.get("longitude"):
-        lines.append(f"Координаты: {rec['latitude']}, {rec['longitude']}")
+    if admin and rec.get("note"):
+        lines.append(f"{FIELD_LABELS['note']}: {rec['note']}")
     return "\n".join(lines)
 
 
@@ -715,7 +733,7 @@ async def get_floor_data(floor: int) -> List[Dict[str, Any]]:
     rows = await db_execute_fetch(
         """
         SELECT id, floor, object_number, sizes, name, gender,
-               passport, plate, phone, latitude, longitude
+               passport, plate, phone, note
         FROM people
         WHERE floor = ?
         ORDER BY object_number, name
@@ -738,8 +756,7 @@ def create_csv_for_floor(data: List[Dict[str, Any]]) -> bytes:
         "passport",
         "plate",
         "phone",
-        "latitude",
-        "longitude",
+        "note",
     ]
     writer = csv.DictWriter(output, fieldnames=fieldnames)
     writer.writeheader()
@@ -1246,7 +1263,7 @@ async def view_handler(callback: types.CallbackQuery):
             await callback.message.answer("Запись не найдена.")
             return
 
-        text = format_card_text(rec)
+        text = format_card_text(rec, admin=is_admin(callback.from_user.id))
 
         if is_admin(callback.from_user.id):
             kb_rows = [
@@ -1356,7 +1373,7 @@ async def inline_handler(inline_query: types.InlineQuery):
 
             sql = f"""
                 SELECT id, floor, object_number, sizes, name, gender,
-                       passport, plate, phone, latitude, longitude
+                       passport, plate, phone
                 FROM people
                 WHERE {" OR ".join(where_clauses)}
                 ORDER BY id
@@ -1392,6 +1409,7 @@ async def main():
     logger.info("Bot starting...")
     try:
         await db_init_pragmas()
+        await migrate_people_table()
         await ensure_temp_allowed_table()
         await ensure_users_tables()
         await dp.start_polling(bot)
